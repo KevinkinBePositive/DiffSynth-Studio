@@ -27,18 +27,21 @@ pipe = WanVideoPipeline.from_pretrained(
     vram_limit=torch.cuda.mem_get_info("cuda")[1] / (1024 ** 3) - 2,
 )
 
-dataset_snapshot_download(
-    dataset_id="DiffSynth-Studio/examples_in_diffsynth",
-    local_dir="./",
-    allow_file_pattern=["data/examples/wan/cat_fightning.jpg"]
-)
-input_image = Image.open("data/examples/wan/cat_fightning.jpg").resize((832, 480))
+# dataset_snapshot_download(
+#     dataset_id="DiffSynth-Studio/examples_in_diffsynth",
+#     local_dir="./",
+#     allow_file_pattern=["data/examples/wan/cat_fightning.jpg"]
+# )
+input_image = Image.open("./zero_shot_test/Segmentation/img/000000000063.jpg").resize((832, 480))
 
 video = pipe(
-    prompt="Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage.",
-    negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
-    seed=0, tiled=True,
+    prompt="Create an animation of instance segmentation being performed on this photograph: each distinct entity is overlaid in a different flat color. Scene: The animation starts from the provided, unaltered photograph. The scene in the photograph is static and doesn’t move. First, the background fades to white. Then, the first entity is covered by a flat color, perfectly preserving its silhouette. Then the second entity, too, is covered by a different flat color, perfectly preserving its silhouette. One by one, each entity is covered by a different flat color. Finally, all entities are covered with different colors. Camera: Static shot without camera movement. No pan. No rotation. No zoom. No glitches or artifacts.",
+    negative_prompt="",
+    seed=27, tiled=True,
+    height=480, width=832,
+    num_frames=81,
+    cfg_scale=5.0, 
     input_image=input_image,
     switch_DiT_boundary=0.9,
 )
-save_video(video, "video_Wan2.2-I2V-A14B.mp4", fps=15, quality=5)
+save_video(video, "./zero_shot_test/Segmentation/output/63.mp4", fps=15, quality=9)
