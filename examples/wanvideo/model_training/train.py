@@ -1,5 +1,5 @@
 import torch, os, argparse, accelerate, warnings
-from diffsynth.core import UnifiedDataset
+from diffsynth.core import UnifiedDataset, load_state_dict
 from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
@@ -23,6 +23,21 @@ class WanTrainingModule(DiffusionTrainingModule):
         task="sft",
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
+        dmd2_teacher_model_id_with_origin_paths=None,
+        dmd2_guidance_model_id_with_origin_paths=None,
+        dmd2_guidance_lora_rank=32,
+        dmd2_guidance_lora_target_modules="q,k,v,o,ffn.0,ffn.2",
+        dmd2_guidance_lora_checkpoint=None,
+        dmd2_num_inference_steps=8,
+        dmd2_student_cfg_scale=1.0,
+        dmd2_real_guidance_scale=4.0,
+        dmd2_fake_guidance_scale=1.0,
+        dmd2_dm_loss_weight=1.0,
+        dmd2_fake_loss_weight=1.0,
+        dmd2_min_step_percent=0.02,
+        dmd2_max_step_percent=0.98,
+        dmd2_switch_DiT_boundary=0.9,
+        dmd2_sigma_shift=5.0,
     ):
         super().__init__()
         # Warning
@@ -44,6 +59,18 @@ class WanTrainingModule(DiffusionTrainingModule):
             preset_lora_path, preset_lora_model,
             task=task,
         )
+
+        if task.startswith("dmd2_distill"):
+            self.setup_dmd2_models(
+                model_id_with_origin_paths=model_id_with_origin_paths,
+                teacher_model_id_with_origin_paths=dmd2_teacher_model_id_with_origin_paths,
+                guidance_model_id_with_origin_paths=dmd2_guidance_model_id_with_origin_paths,
+                guidance_lora_base_model=lora_base_model or (trainable_models.split(",")[0] if trainable_models is not None else "dit"),
+                guidance_lora_rank=dmd2_guidance_lora_rank,
+                guidance_lora_target_modules=dmd2_guidance_lora_target_modules,
+                guidance_lora_checkpoint=dmd2_guidance_lora_checkpoint,
+                device=device,
+            )
         
         # Store other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -51,6 +78,16 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []
         self.fp8_models = fp8_models
         self.task = task
+        self.dmd2_num_inference_steps = dmd2_num_inference_steps
+        self.dmd2_student_cfg_scale = dmd2_student_cfg_scale
+        self.dmd2_real_guidance_scale = dmd2_real_guidance_scale
+        self.dmd2_fake_guidance_scale = dmd2_fake_guidance_scale
+        self.dmd2_dm_loss_weight = dmd2_dm_loss_weight
+        self.dmd2_fake_loss_weight = dmd2_fake_loss_weight
+        self.dmd2_min_step_percent = dmd2_min_step_percent
+        self.dmd2_max_step_percent = dmd2_max_step_percent
+        self.dmd2_switch_DiT_boundary = dmd2_switch_DiT_boundary
+        self.dmd2_sigma_shift = dmd2_sigma_shift
         self.task_to_loss = {
             "sft:data_process": lambda pipe, *args: args,
             "direct_distill:data_process": lambda pipe, *args: args,
@@ -58,9 +95,78 @@ class WanTrainingModule(DiffusionTrainingModule):
             "sft:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
+            "dmd2_distill": self.dmd2_loss,
+            "dmd2_distill:train": self.dmd2_loss,
         }
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
+
+    def setup_dmd2_models(
+        self,
+        model_id_with_origin_paths,
+        teacher_model_id_with_origin_paths,
+        guidance_model_id_with_origin_paths,
+        guidance_lora_base_model,
+        guidance_lora_rank,
+        guidance_lora_target_modules,
+        guidance_lora_checkpoint,
+        device,
+    ):
+        teacher_paths = teacher_model_id_with_origin_paths or model_id_with_origin_paths
+        guidance_paths = guidance_model_id_with_origin_paths or teacher_paths
+        teacher_configs = self.parse_model_configs(None, teacher_paths, device=device)
+        guidance_configs = self.parse_model_configs(None, guidance_paths, device=device)
+        self.dmd2_teacher_pipe = WanVideoPipeline.from_pretrained(
+            torch_dtype=torch.bfloat16, device=device,
+            model_configs=teacher_configs, tokenizer_config=None, audio_processor_config=None,
+        )
+        self.dmd2_guidance_pipe = WanVideoPipeline.from_pretrained(
+            torch_dtype=torch.bfloat16, device=device,
+            model_configs=guidance_configs, tokenizer_config=None, audio_processor_config=None,
+        )
+        self.dmd2_teacher_pipe.freeze_except([])
+        self.dmd2_guidance_pipe.freeze_except([])
+
+        if guidance_lora_rank > 0:
+            if not hasattr(self.dmd2_guidance_pipe, guidance_lora_base_model) or getattr(self.dmd2_guidance_pipe, guidance_lora_base_model) is None:
+                raise ValueError(f"DMD2 guidance model `{guidance_lora_base_model}` is not available.")
+            guidance_model = getattr(self.dmd2_guidance_pipe, guidance_lora_base_model)
+            guidance_model = self.add_lora_to_model(
+                guidance_model,
+                target_modules=self.parse_lora_target_modules(guidance_model, guidance_lora_target_modules),
+                lora_rank=guidance_lora_rank,
+                upcast_dtype=self.dmd2_guidance_pipe.torch_dtype,
+            )
+            if guidance_lora_checkpoint is not None:
+                lora = load_state_dict(guidance_lora_checkpoint)
+                lora_loader = self.dmd2_guidance_pipe.lora_loader(torch_dtype=self.dmd2_guidance_pipe.torch_dtype, device=self.dmd2_guidance_pipe.device)
+                lora = lora_loader.convert_state_dict(lora)
+                lora = self.mapping_lora_state_dict(lora)
+                guidance_model.load_state_dict(lora, strict=False)
+            setattr(self.dmd2_guidance_pipe, guidance_lora_base_model, guidance_model)
+        else:
+            self.dmd2_guidance_pipe.freeze_except([guidance_lora_base_model])
+
+    def dmd2_loss(self, pipe, inputs_shared, inputs_posi, inputs_nega):
+        return DMD2FlowMatchLoss(
+            pipe, self.dmd2_teacher_pipe, self.dmd2_guidance_pipe,
+            inputs_shared, inputs_posi, inputs_nega,
+            num_inference_steps=self.dmd2_num_inference_steps,
+            student_cfg_scale=self.dmd2_student_cfg_scale,
+            real_guidance_scale=self.dmd2_real_guidance_scale,
+            fake_guidance_scale=self.dmd2_fake_guidance_scale,
+            dm_loss_weight=self.dmd2_dm_loss_weight,
+            fake_loss_weight=self.dmd2_fake_loss_weight,
+            min_step_percent=self.dmd2_min_step_percent,
+            max_step_percent=self.dmd2_max_step_percent,
+            switch_DiT_boundary=self.dmd2_switch_DiT_boundary,
+            sigma_shift=self.dmd2_sigma_shift,
+        )
+
+    def export_trainable_state_dict(self, state_dict, remove_prefix=None):
+        if self.task.startswith("dmd2_distill"):
+            state_dict = {name: param for name, param in state_dict.items() if name.startswith("pipe.")}
+        return super().export_trainable_state_dict(state_dict, remove_prefix=remove_prefix)
         
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
         for extra_input in extra_inputs:
@@ -121,6 +227,21 @@ def wan_parser():
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--framewise_decoding", default=False, action="store_true", help="Enable it if this model is a WanToDance global model.")
+    parser.add_argument("--dmd2_teacher_model_id_with_origin_paths", type=str, default=None, help="Teacher model configs for DMD2. Defaults to --model_id_with_origin_paths.")
+    parser.add_argument("--dmd2_guidance_model_id_with_origin_paths", type=str, default=None, help="Fake-score guidance model configs for DMD2. Defaults to teacher configs.")
+    parser.add_argument("--dmd2_guidance_lora_rank", type=int, default=32, help="LoRA rank for the DMD2 fake-score guidance model. Set 0 for full guidance training.")
+    parser.add_argument("--dmd2_guidance_lora_target_modules", type=str, default="q,k,v,o,ffn.0,ffn.2", help="LoRA target modules for the DMD2 fake-score guidance model.")
+    parser.add_argument("--dmd2_guidance_lora_checkpoint", type=str, default=None, help="Optional LoRA checkpoint for the DMD2 fake-score guidance model.")
+    parser.add_argument("--dmd2_num_inference_steps", type=int, default=8, help="Number of student denoising steps used during DMD2 training.")
+    parser.add_argument("--dmd2_student_cfg_scale", type=float, default=1.0, help="CFG scale used by the student generator during DMD2 sampling.")
+    parser.add_argument("--dmd2_real_guidance_scale", type=float, default=4.0, help="CFG scale used by the frozen teacher score in DMD2.")
+    parser.add_argument("--dmd2_fake_guidance_scale", type=float, default=1.0, help="CFG scale used by the fake-score model in DMD2.")
+    parser.add_argument("--dmd2_dm_loss_weight", type=float, default=1.0, help="Weight for DMD2 distribution matching loss.")
+    parser.add_argument("--dmd2_fake_loss_weight", type=float, default=1.0, help="Weight for DMD2 fake-score training loss.")
+    parser.add_argument("--dmd2_min_step_percent", type=float, default=0.02, help="Minimum DMD2 score timestep as a scheduler-index fraction.")
+    parser.add_argument("--dmd2_max_step_percent", type=float, default=0.98, help="Maximum DMD2 score timestep as a scheduler-index fraction.")
+    parser.add_argument("--dmd2_switch_DiT_boundary", type=float, default=0.9, help="Wan2.2 high/low DiT switch boundary used while sampling the 8-step student.")
+    parser.add_argument("--dmd2_sigma_shift", type=float, default=5.0, help="Wan FlowMatch sigma shift for DMD2 sampling and score timesteps.")
     return parser
 
 
@@ -131,6 +252,14 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
+    extra_inputs = set(args.extra_inputs.split(",")) if args.extra_inputs is not None else set()
+    special_operator_map = {
+        "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
+        "wantodance_music_path": ToAbsolutePath(args.dataset_base_path),
+    }
+    if "input_audio" in extra_inputs:
+        special_operator_map["input_audio"] = ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000)
+
     dataset = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path,
@@ -147,11 +276,7 @@ if __name__ == "__main__":
             time_division_factor=4 if not args.framewise_decoding else 1,
             time_division_remainder=1 if not args.framewise_decoding else 0,
         ),
-        special_operator_map={
-            "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
-            "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
-            "wantodance_music_path": ToAbsolutePath(args.dataset_base_path),
-        }
+        special_operator_map=special_operator_map,
     )
     model = WanTrainingModule(
         model_paths=args.model_paths,
@@ -174,6 +299,21 @@ if __name__ == "__main__":
         device="cpu" if args.initialize_model_on_cpu else accelerator.device,
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
+        dmd2_teacher_model_id_with_origin_paths=args.dmd2_teacher_model_id_with_origin_paths,
+        dmd2_guidance_model_id_with_origin_paths=args.dmd2_guidance_model_id_with_origin_paths,
+        dmd2_guidance_lora_rank=args.dmd2_guidance_lora_rank,
+        dmd2_guidance_lora_target_modules=args.dmd2_guidance_lora_target_modules,
+        dmd2_guidance_lora_checkpoint=args.dmd2_guidance_lora_checkpoint,
+        dmd2_num_inference_steps=args.dmd2_num_inference_steps,
+        dmd2_student_cfg_scale=args.dmd2_student_cfg_scale,
+        dmd2_real_guidance_scale=args.dmd2_real_guidance_scale,
+        dmd2_fake_guidance_scale=args.dmd2_fake_guidance_scale,
+        dmd2_dm_loss_weight=args.dmd2_dm_loss_weight,
+        dmd2_fake_loss_weight=args.dmd2_fake_loss_weight,
+        dmd2_min_step_percent=args.dmd2_min_step_percent,
+        dmd2_max_step_percent=args.dmd2_max_step_percent,
+        dmd2_switch_DiT_boundary=args.dmd2_switch_DiT_boundary,
+        dmd2_sigma_shift=args.dmd2_sigma_shift,
     )
     model_logger = ModelLogger(
         args.output_path,
@@ -186,5 +326,7 @@ if __name__ == "__main__":
         "sft:train": launch_training_task,
         "direct_distill": launch_training_task,
         "direct_distill:train": launch_training_task,
+        "dmd2_distill": launch_training_task,
+        "dmd2_distill:train": launch_training_task,
     }
     launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)

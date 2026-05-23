@@ -1,5 +1,6 @@
 from .base_pipeline import BasePipeline
 import torch
+import torch.nn.functional as F
 
 
 def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
@@ -73,6 +74,143 @@ def DirectDistillLoss(pipe: BasePipeline, **inputs):
         inputs["latents"] = pipe.step(pipe.scheduler, progress_id=progress_id, noise_pred=noise_pred, **inputs)
     loss = torch.nn.functional.mse_loss(inputs["latents"].float(), inputs["input_latents"].float())
     return loss
+
+
+def _flow_match_sigma(pipe: BasePipeline, timestep: torch.Tensor, sample: torch.Tensor):
+    timestep_id = torch.argmin((pipe.scheduler.timesteps - timestep.to(pipe.scheduler.timesteps.device)).abs())
+    sigma = pipe.scheduler.sigmas[timestep_id]
+    return sigma.to(device=sample.device, dtype=sample.dtype)
+
+
+def _flow_match_pred_x0(pipe: BasePipeline, noisy_latents: torch.Tensor, model_output: torch.Tensor, timestep: torch.Tensor):
+    sigma = _flow_match_sigma(pipe, timestep, noisy_latents)
+    while sigma.ndim < noisy_latents.ndim:
+        sigma = sigma.view(*sigma.shape, 1)
+    return noisy_latents - sigma * model_output
+
+
+def _wan_iteration_models(pipe: BasePipeline, source_pipe: BasePipeline, timestep: torch.Tensor, switch_DiT_boundary: float):
+    timestep_value = float(timestep.detach().float().mean().item())
+    use_second_dit = timestep_value < switch_DiT_boundary * 1000 and getattr(source_pipe, "dit2", None) is not None
+    model_names = source_pipe.in_iteration_models_2 if use_second_dit else source_pipe.in_iteration_models
+    models = {name: getattr(source_pipe, name) for name in model_names}
+    if use_second_dit:
+        models["dit"] = models.pop("dit2")
+        if "vace2" in models:
+            models["vace"] = models.pop("vace2")
+    return models
+
+
+def _wan_predict(
+    pipe: BasePipeline,
+    source_pipe: BasePipeline,
+    inputs_shared,
+    inputs_posi,
+    inputs_nega,
+    timestep,
+    cfg_scale=1.0,
+    switch_DiT_boundary=0.9,
+    progress_id=None,
+):
+    models = _wan_iteration_models(pipe, source_pipe, timestep, switch_DiT_boundary)
+    if cfg_scale != 1.0:
+        return pipe.cfg_guided_model_fn(
+            pipe.model_fn, cfg_scale,
+            inputs_shared, inputs_posi, inputs_nega,
+            **models, timestep=timestep, progress_id=progress_id
+        )
+    return pipe.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep, progress_id=progress_id)
+
+
+def DMD2FlowMatchLoss(
+    pipe: BasePipeline,
+    teacher_pipe: BasePipeline,
+    guidance_pipe: BasePipeline,
+    inputs_shared,
+    inputs_posi,
+    inputs_nega,
+    num_inference_steps=8,
+    student_cfg_scale=1.0,
+    real_guidance_scale=4.0,
+    fake_guidance_scale=1.0,
+    dm_loss_weight=1.0,
+    fake_loss_weight=1.0,
+    min_step_percent=0.02,
+    max_step_percent=0.98,
+    switch_DiT_boundary=0.9,
+    sigma_shift=5.0,
+):
+    """DMD2-style distribution matching for Flow Matching video pipelines.
+
+    This follows DMD2's two-score idea: a frozen teacher estimates the real
+    score, a trainable fake-guidance model estimates the generator score, and
+    the student is updated with the resulting distribution-matching gradient.
+    """
+    sample_inputs = dict(inputs_shared)
+    sample_inputs["latents"] = sample_inputs["latents"].clone()
+
+    pipe.scheduler.set_timesteps(num_inference_steps, shift=sigma_shift)
+    for progress_id, timestep in enumerate(pipe.scheduler.timesteps):
+        timestep = timestep.unsqueeze(0).to(dtype=pipe.torch_dtype, device=pipe.device)
+        noise_pred = _wan_predict(
+            pipe, pipe, sample_inputs, inputs_posi, inputs_nega,
+            timestep=timestep, cfg_scale=student_cfg_scale,
+            switch_DiT_boundary=switch_DiT_boundary,
+            progress_id=progress_id,
+        )
+        sample_inputs["latents"] = pipe.step(pipe.scheduler, progress_id=progress_id, noise_pred=noise_pred, **sample_inputs)
+
+    generated_latents = sample_inputs["latents"]
+
+    pipe.scheduler.set_timesteps(1000, training=True, shift=sigma_shift)
+    min_step = int(min_step_percent * len(pipe.scheduler.timesteps))
+    max_step = int(max_step_percent * len(pipe.scheduler.timesteps))
+    max_step = max(min(max_step, len(pipe.scheduler.timesteps)), min_step + 1)
+    timestep_id = torch.randint(min_step, max_step, (1,), device=generated_latents.device)
+    timestep = pipe.scheduler.timesteps[timestep_id.cpu()].to(dtype=pipe.torch_dtype, device=pipe.device)
+    noise = torch.randn_like(generated_latents)
+    noisy_latents = pipe.scheduler.add_noise(generated_latents, noise, timestep)
+
+    score_inputs = dict(sample_inputs)
+    score_inputs["latents"] = noisy_latents
+
+    with torch.no_grad():
+        pred_fake = _wan_predict(
+            pipe, guidance_pipe, score_inputs, inputs_posi, inputs_nega,
+            timestep=timestep, cfg_scale=fake_guidance_scale,
+            switch_DiT_boundary=switch_DiT_boundary,
+        )
+        pred_fake_x0 = _flow_match_pred_x0(pipe, noisy_latents, pred_fake, timestep)
+
+        pred_real = _wan_predict(
+            pipe, teacher_pipe, score_inputs, inputs_posi, inputs_nega,
+            timestep=timestep, cfg_scale=real_guidance_scale,
+            switch_DiT_boundary=switch_DiT_boundary,
+        )
+        pred_real_x0 = _flow_match_pred_x0(pipe, noisy_latents, pred_real, timestep)
+
+        p_real = generated_latents - pred_real_x0
+        p_fake = generated_latents - pred_fake_x0
+        reduce_dims = tuple(range(1, generated_latents.ndim))
+        grad = (p_real - p_fake) / torch.clamp(p_real.abs().mean(dim=reduce_dims, keepdim=True), min=1e-6)
+        grad = torch.nan_to_num(grad)
+
+    loss_dm = 0.5 * F.mse_loss(generated_latents.float(), (generated_latents - grad).detach().float())
+
+    fake_latents = generated_latents.detach()
+    fake_noise = torch.randn_like(fake_latents)
+    fake_noisy_latents = pipe.scheduler.add_noise(fake_latents, fake_noise, timestep)
+    fake_inputs = dict(sample_inputs)
+    fake_inputs["latents"] = fake_noisy_latents
+    pred_fake_train = _wan_predict(
+        pipe, guidance_pipe, fake_inputs, inputs_posi, inputs_nega,
+        timestep=timestep, cfg_scale=1.0,
+        switch_DiT_boundary=switch_DiT_boundary,
+    )
+    fake_target = pipe.scheduler.training_target(fake_latents, fake_noise, timestep)
+    loss_fake = F.mse_loss(pred_fake_train.float(), fake_target.float())
+
+    return dm_loss_weight * loss_dm + fake_loss_weight * loss_fake
 
 
 class TrajectoryImitationLoss(torch.nn.Module):
