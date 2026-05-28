@@ -93,12 +93,17 @@ def _wan_iteration_models(pipe: BasePipeline, source_pipe: BasePipeline, timeste
     timestep_value = float(timestep.detach().float().mean().item())
     use_second_dit = timestep_value < switch_DiT_boundary * 1000 and getattr(source_pipe, "dit2", None) is not None
     model_names = source_pipe.in_iteration_models_2 if use_second_dit else source_pipe.in_iteration_models
+    source_pipe.load_models_to_device(model_names)
     models = {name: getattr(source_pipe, name) for name in model_names}
     if use_second_dit:
         models["dit"] = models.pop("dit2")
         if "vace2" in models:
             models["vace"] = models.pop("vace2")
     return models
+
+
+def _wan_offload_iteration_models(source_pipe: BasePipeline):
+    source_pipe.load_models_to_device([])
 
 
 def _wan_predict(
@@ -188,6 +193,7 @@ def DMD2FlowMatchLoss(
             switch_DiT_boundary=switch_DiT_boundary,
         )
         pred_real_x0 = _flow_match_pred_x0(pipe, noisy_latents, pred_real, timestep)
+        _wan_offload_iteration_models(teacher_pipe)
 
         p_real = generated_latents - pred_real_x0
         p_fake = generated_latents - pred_fake_x0

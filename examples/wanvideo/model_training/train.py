@@ -25,6 +25,10 @@ class WanTrainingModule(DiffusionTrainingModule):
         min_timestep_boundary=0.0,
         dmd2_teacher_model_id_with_origin_paths=None,
         dmd2_guidance_model_id_with_origin_paths=None,
+        dmd2_teacher_fp8_models=None,
+        dmd2_teacher_offload_models=None,
+        dmd2_guidance_fp8_models=None,
+        dmd2_guidance_offload_models=None,
         dmd2_guidance_lora_rank=32,
         dmd2_guidance_lora_target_modules="q,k,v,o,ffn.0,ffn.2",
         dmd2_guidance_lora_checkpoint=None,
@@ -60,11 +64,15 @@ class WanTrainingModule(DiffusionTrainingModule):
             task=task,
         )
 
-        if task.startswith("dmd2_distill"):
+        if task.startswith("dmd2_distill") and not task.endswith(":data_process"):
             self.setup_dmd2_models(
                 model_id_with_origin_paths=model_id_with_origin_paths,
                 teacher_model_id_with_origin_paths=dmd2_teacher_model_id_with_origin_paths,
                 guidance_model_id_with_origin_paths=dmd2_guidance_model_id_with_origin_paths,
+                teacher_fp8_models=dmd2_teacher_fp8_models if dmd2_teacher_fp8_models is not None else fp8_models,
+                teacher_offload_models=dmd2_teacher_offload_models if dmd2_teacher_offload_models is not None else offload_models,
+                guidance_fp8_models=dmd2_guidance_fp8_models if dmd2_guidance_fp8_models is not None else fp8_models,
+                guidance_offload_models=dmd2_guidance_offload_models if dmd2_guidance_offload_models is not None else offload_models,
                 guidance_lora_base_model=lora_base_model or (trainable_models.split(",")[0] if trainable_models is not None else "dit"),
                 guidance_lora_rank=dmd2_guidance_lora_rank,
                 guidance_lora_target_modules=dmd2_guidance_lora_target_modules,
@@ -91,6 +99,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.task_to_loss = {
             "sft:data_process": lambda pipe, *args: args,
             "direct_distill:data_process": lambda pipe, *args: args,
+            "dmd2_distill:data_process": lambda pipe, *args: args,
             "sft": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
             "sft:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
@@ -106,6 +115,10 @@ class WanTrainingModule(DiffusionTrainingModule):
         model_id_with_origin_paths,
         teacher_model_id_with_origin_paths,
         guidance_model_id_with_origin_paths,
+        teacher_fp8_models,
+        teacher_offload_models,
+        guidance_fp8_models,
+        guidance_offload_models,
         guidance_lora_base_model,
         guidance_lora_rank,
         guidance_lora_target_modules,
@@ -114,8 +127,14 @@ class WanTrainingModule(DiffusionTrainingModule):
     ):
         teacher_paths = teacher_model_id_with_origin_paths or model_id_with_origin_paths
         guidance_paths = guidance_model_id_with_origin_paths or teacher_paths
-        teacher_configs = self.parse_model_configs(None, teacher_paths, device=device)
-        guidance_configs = self.parse_model_configs(None, guidance_paths, device=device)
+        teacher_configs = self.parse_model_configs(
+            None, teacher_paths,
+            fp8_models=teacher_fp8_models, offload_models=teacher_offload_models, device=device,
+        )
+        guidance_configs = self.parse_model_configs(
+            None, guidance_paths,
+            fp8_models=guidance_fp8_models, offload_models=guidance_offload_models, device=device,
+        )
         self.dmd2_teacher_pipe = WanVideoPipeline.from_pretrained(
             torch_dtype=torch.bfloat16, device=device,
             model_configs=teacher_configs, tokenizer_config=None, audio_processor_config=None,
@@ -229,6 +248,10 @@ def wan_parser():
     parser.add_argument("--framewise_decoding", default=False, action="store_true", help="Enable it if this model is a WanToDance global model.")
     parser.add_argument("--dmd2_teacher_model_id_with_origin_paths", type=str, default=None, help="Teacher model configs for DMD2. Defaults to --model_id_with_origin_paths.")
     parser.add_argument("--dmd2_guidance_model_id_with_origin_paths", type=str, default=None, help="Fake-score guidance model configs for DMD2. Defaults to teacher configs.")
+    parser.add_argument("--dmd2_teacher_fp8_models", type=str, default=None, help="Teacher models with FP8 precision for DMD2. Defaults to --fp8_models.")
+    parser.add_argument("--dmd2_teacher_offload_models", type=str, default=None, help="Teacher models with VRAM offload for DMD2. Defaults to --offload_models.")
+    parser.add_argument("--dmd2_guidance_fp8_models", type=str, default=None, help="Fake-score guidance models with FP8 precision for DMD2. Defaults to --fp8_models.")
+    parser.add_argument("--dmd2_guidance_offload_models", type=str, default=None, help="Fake-score guidance models with VRAM offload for DMD2. Defaults to --offload_models.")
     parser.add_argument("--dmd2_guidance_lora_rank", type=int, default=32, help="LoRA rank for the DMD2 fake-score guidance model. Set 0 for full guidance training.")
     parser.add_argument("--dmd2_guidance_lora_target_modules", type=str, default="q,k,v,o,ffn.0,ffn.2", help="LoRA target modules for the DMD2 fake-score guidance model.")
     parser.add_argument("--dmd2_guidance_lora_checkpoint", type=str, default=None, help="Optional LoRA checkpoint for the DMD2 fake-score guidance model.")
@@ -301,6 +324,10 @@ if __name__ == "__main__":
         min_timestep_boundary=args.min_timestep_boundary,
         dmd2_teacher_model_id_with_origin_paths=args.dmd2_teacher_model_id_with_origin_paths,
         dmd2_guidance_model_id_with_origin_paths=args.dmd2_guidance_model_id_with_origin_paths,
+        dmd2_teacher_fp8_models=args.dmd2_teacher_fp8_models,
+        dmd2_teacher_offload_models=args.dmd2_teacher_offload_models,
+        dmd2_guidance_fp8_models=args.dmd2_guidance_fp8_models,
+        dmd2_guidance_offload_models=args.dmd2_guidance_offload_models,
         dmd2_guidance_lora_rank=args.dmd2_guidance_lora_rank,
         dmd2_guidance_lora_target_modules=args.dmd2_guidance_lora_target_modules,
         dmd2_guidance_lora_checkpoint=args.dmd2_guidance_lora_checkpoint,
@@ -322,6 +349,7 @@ if __name__ == "__main__":
     launcher_map = {
         "sft:data_process": launch_data_process_task,
         "direct_distill:data_process": launch_data_process_task,
+        "dmd2_distill:data_process": launch_data_process_task,
         "sft": launch_training_task,
         "sft:train": launch_training_task,
         "direct_distill": launch_training_task,
